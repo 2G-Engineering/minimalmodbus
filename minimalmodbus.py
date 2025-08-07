@@ -36,6 +36,7 @@ import time
 from typing import Any, Dict, List, Optional, Type, Union
 
 import serial
+import socket
 
 _NUMBER_OF_BYTES_BEFORE_REGISTERDATA = 1  # Within the payload
 _NUMBER_OF_BYTES_PER_REGISTER = 2
@@ -90,6 +91,105 @@ class _Payloadformat(enum.Enum):
     REGISTERS = enum.auto()
     STRING = enum.auto()
 
+# ######################## #
+# Modbus TCP object        #
+# ######################## #
+
+class _ModbusTcpTransport:
+    def __init__(self, host: str, port: int, unit_id: int, timeout: float, debug: bool = False):
+        """
+        Initialize TCP transport for Modbus/TCP.
+
+        Establish a TCP socket connection to the specified host and port, set
+        the unit identifier for the Modbus slave, and configure timeouts.
+        """
+        self.host = host
+        self.port = port
+        self.unit_id = unit_id
+        self.transaction_id = 0
+        self.debug = debug
+        self.socket = socket.create_connection((host, port), timeout)
+        self.socket.settimeout(timeout)
+        self._latest_roundtrip_time: Optional[float] = None
+
+    def _build_mbap_header(self, pdu_length: int) -> bytes:
+        """
+        Construct the 7-byte MBAP (Modbus Application Protocol) header.
+
+        MBAP header consists of:
+            - Transaction ID (2 bytes)
+            - Protocol ID (2 bytes) (always 0 for Modbus)
+            - Length field (2 bytes) (pdu_length + unit_id byte)
+            - Unit ID (1 byte)
+
+        Args:
+            pdu_length: Number of bytes in the PDU (function + payload).
+        Returns:
+            Bytes object containing the packed MBAP header.
+        """
+        # transaction, protocol (0), length, unit id
+        return struct.pack('>HHHB',
+                           self.transaction_id,
+                           0,
+                           pdu_length,
+                           self.unit_id)
+
+    def communicate_tcp(self, function_code: int, payload: bytes) -> bytes:
+        """
+        Send a Modbus/TCP request and receive the response PDU.
+
+        Args:
+            function_code: Modbus function code (1 byte).
+            payload: Payload bytes following the function code.
+        Returns:
+            Raw PDU bytes from the slave response.
+        """
+        # Increment transaction id (16-bit wrap)
+        self.transaction_id = (self.transaction_id + 1) & 0xFFFF
+
+        # Build PDU and MBAP header
+        pdu = bytes([function_code]) + payload
+        mbap = self._build_mbap_header(len(pdu))
+        frame = mbap + pdu
+
+        if self.debug:
+            print(f"MinimalModbus debug mode. TCP -> {self.host}:{self.port}")
+            print(f"  Transaction ID: {self.transaction_id}")
+            print(f"  Function code: {function_code}")
+            print(f"  Full frame to send: {_describe_bytes(frame)}")
+
+        # Send the frame on the socket and record start time.
+        start = time.monotonic()
+        self.socket.sendall(frame)
+
+        # Read the 7-byte MBAP response header.
+        resp_header = self.socket.recv(7)
+        if self.debug:
+            print(f"MinimalModbus debug mode. Received MBAP header: {_describe_bytes(resp_header)}")
+
+        # Unpack MBAP: transaction, protocol, length, unit
+        rx_transaction, rx_protocol, length, rx_unit = struct.unpack('>HHHB', resp_header)
+        if self.debug:
+            print(f"  Parsed MBAP -> transaction={rx_transaction}, protocol={rx_protocol}, "
+                  f"length={length}, unit={rx_unit}")
+
+        # Length includes unit_id + PDU, so subtract 1
+        pdu_length = length - 1
+        if self.debug:
+            print(f"  Expecting {pdu_length} bytes of PDU")
+
+        # Read the remaining PDU bytes.
+        pdu_only = self.socket.recv(pdu_length)
+        end = time.monotonic()
+
+        # Record end time and compute round-trip duration.
+        self._latest_roundtrip_time = end - start
+        if self.debug:
+            print(f"MinimalModbus debug mode. Received PDU: {_describe_bytes(pdu_only)}")
+            print(f"  Roundtrip time: {(self._latest_roundtrip_time * 1000):.1f} ms")
+
+        # Return the raw PDU (function code + data)
+        return pdu_only
 
 # ######################## #
 # Modbus instrument object #
@@ -194,6 +294,18 @@ class Instrument:
         New in version 0.7.
         """
 
+        if isinstance(port, str) and "://" in port:
+            scheme, address    = port.split("://", 1) # parse connection string, example: "tcp://host:port"
+            host_str, port_str = address.split(":", 1)
+            self.tcp = _ModbusTcpTransport(
+                host=host_str,
+                port=int(port_str),
+                unit_id=self.address,
+                timeout=0.05,
+                debug=self.debug,
+            )
+            return
+            
         self.serial: Optional[serial.Serial] = None
         """The serial port object as defined by the pySerial module. Created by the
         constructor.
@@ -1314,10 +1426,16 @@ class Instrument:
             TypeError, ValueError, ModbusException,
             serial.SerialException (inherited from IOError)
 
-        Makes use of the :meth:`_communicate` method. The request is generated
+        Makes use of the :meth:`_communicate_serial` method. The request is generated
         with the :func:`_embed_payload` function, and the parsing of the
         response is done with the :func:`_extract_payload` function.
         """
+        
+        if hasattr(self, "tcp"): 
+            # tcp comms
+            return self.tcp.communicate_tcp(functioncode, payload_to_slave)
+        #else: serial comms
+            
         DEFAULT_NUMBER_OF_BYTES_TO_READ = 1000
 
         _check_functioncode(functioncode, None)
@@ -1350,7 +1468,7 @@ class Instrument:
                     )
 
         # Communicate
-        response_bytes = self._communicate(request_bytes, number_of_bytes_to_read)
+        response_bytes = self._communicate_serial(request_bytes, number_of_bytes_to_read)
 
         if number_of_bytes_to_read == 0:
             return b""
@@ -1361,7 +1479,7 @@ class Instrument:
         )
         return payload_from_slave
 
-    def _communicate(self, request: bytes, number_of_bytes_to_read: int) -> bytes:
+    def _communicate_serial(self, request: bytes, number_of_bytes_to_read: int) -> bytes:
         """Talk to the slave via a serial port.
 
         Args:
